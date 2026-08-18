@@ -5,6 +5,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
+from .constants import CLIENT_NAME, CLIENT_VERSION
 from .window import JellyfinWindow
 
 
@@ -25,8 +26,9 @@ def main() -> int:
     args = parse_args()
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Webbyfin")
-    app.setOrganizationName("Webbyfin")
+    app.setApplicationName(CLIENT_NAME)
+    app.setApplicationVersion(CLIENT_VERSION)
+    app.setOrganizationName(CLIENT_NAME)
 
     window = JellyfinWindow(args.server)
     window.show()
