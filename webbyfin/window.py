@@ -7,7 +7,12 @@ from urllib.parse import urlparse
 from PySide6.QtCore import QFile, QIODevice, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QColor
 from PySide6.QtWebChannel import QWebChannel
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
+from PySide6.QtWebEngineCore import (
+    QWebEngineFullScreenRequest,
+    QWebEnginePage,
+    QWebEngineScript,
+    QWebEngineSettings,
+)
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QMainWindow, QStackedLayout, QWidget
 
@@ -54,6 +59,11 @@ class JellyfinWindow(QMainWindow):
         self.web.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         page = JellyfinPage(self.web)
         page.setBackgroundColor(QColor(Qt.GlobalColor.transparent))
+        page.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.FullScreenSupportEnabled,
+            True,
+        )
+        page.fullScreenRequested.connect(self._handle_fullscreen_request)
         self.web.setPage(page)
 
         self.player = MpvPlayer(server_url, content)
@@ -71,6 +81,14 @@ class JellyfinWindow(QMainWindow):
         self._install_native_shell()
 
         self.web.load(QUrl(server_url))
+
+    def _handle_fullscreen_request(self, request: QWebEngineFullScreenRequest) -> None:
+        toggle_on = request.toggleOn()
+        request.accept()
+        if toggle_on:
+            self.showFullScreen()
+        else:
+            self.showNormal()
 
     def _install_native_shell(self) -> None:
         factory = Path(__file__).with_name("native.js").read_text(encoding="utf-8")

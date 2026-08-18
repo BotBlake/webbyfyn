@@ -401,6 +401,11 @@ function createNativeShell(config) {
         }
 
         _removeVideoDialog() {
+            if (document.fullscreenElement) {
+                void document.exitFullscreen().catch(error => {
+                    console.error(`${logPrefix} ${error.message}`);
+                });
+            }
             this.setTransparency("none");
             document.body.classList.remove("hide-scroll");
             this._videoDialog?.remove();
@@ -428,7 +433,7 @@ function createNativeShell(config) {
         getPlugins: () => ["mpvVideoPlayer"],
         AppHost: {
             init: () => Promise.resolve({ deviceName, appName, appVersion }),
-            supports: () => false,
+            supports: feature => feature === "fullscreenchange",
             getDefaultLayout: () => "desktop",
             getDeviceProfile: copyDeviceProfile,
             getSyncProfile: copyDeviceProfile,
