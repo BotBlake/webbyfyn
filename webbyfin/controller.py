@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import locale
 import sys
 
 from PySide6.QtCore import Qt
@@ -30,6 +31,7 @@ def main() -> int:
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     QQuickWindow.setGraphicsApi(QSGRendererInterface.GraphicsApi.OpenGL)
     app = QApplication(sys.argv)
+    locale.setlocale(locale.LC_NUMERIC, "C")
     app.setApplicationName(CLIENT_NAME)
     app.setApplicationVersion(CLIENT_VERSION)
     app.setOrganizationName(CLIENT_NAME)
