@@ -2,26 +2,28 @@ function createNativeShell(config) {
     "use strict";
 
     const { appName, appVersion, deviceName, deviceProfile, logPrefix } = config;
-    const copyDeviceProfile = () => JSON.parse(JSON.stringify(deviceProfile));
+    const cloneDeviceProfile = () => structuredClone(deviceProfile);
+    const logError = error => console.error(`${logPrefix} ${error.message}`);
 
-    let bridgePromise;
-    const getBridge = () => {
-        bridgePromise ??= new Promise((resolve, reject) => {
+    // Qt bridge
+    let mpvBridgePromise;
+    const getMpvBridge = () => {
+        mpvBridgePromise ??= new Promise((resolve, reject) => {
             if (typeof QWebChannel !== "function" || !window.qt?.webChannelTransport) {
                 reject(new Error("Qt WebChannel is unavailable"));
-                return;
+            return;
             }
 
             new QWebChannel(window.qt.webChannelTransport, channel => {
-                const player = channel.objects.player;
-                if (player) {
-                    resolve(player);
+                const bridge = channel.objects.player;
+                if (bridge) {
+                    resolve(bridge);
                 } else {
                     reject(new Error("MPV bridge is unavailable"));
                 }
             });
         });
-        return bridgePromise;
+        return mpvBridgePromise;
     };
 
     const redactUrl = (value) => {
@@ -35,35 +37,29 @@ function createNativeShell(config) {
         }
     };
 
-    const sendMpvCommand = (command, ...args) => {
+    const sendMpvCommand = async (command, ...args) => {
         const loggedArgs = command === "loadfile" || command === "sub-add"
             ? [redactUrl(args[0]), ...args.slice(1)]
             : args;
 
         console.info(`${logPrefix} ${JSON.stringify({ command, args: loggedArgs })}`);
 
-        return getBridge().then(player => new Promise((resolve, reject) => {
-            player.dispatch(command, args, accepted => {
-                if (accepted) {
-                    resolve();
-                } else {
-                    reject(new Error(`MPV rejected ${command}`));
-                }
-            });
-        }));
+        const bridge = await getMpvBridge();
+        const accepted = await new Promise(resolve => {
+            bridge.dispatch(command, args, resolve);
+        });
+        if (!accepted) {
+            throw new Error(`MPV rejected ${command}`);
+        }
     };
 
     const sendMpvCommandSoon = (command, ...args) => {
-        void sendMpvCommand(command, ...args).catch(error => {
-            console.error(`${logPrefix} ${error.message}`);
-        });
+        void sendMpvCommand(command, ...args).catch(logError);
     };
 
+    // Jellyfin player plugin
     class MpvVideoPlayer {
         constructor({ events, loading, appRouter, appHost, dashboard }) {
-            this.name = "MPV Video Player";
-            this.type = "mediaplayer";
-            this.id = "mpvvideoplayer";
             this.priority = -1;
             this.isLocalPlayer = true;
             this.useFullSubtitleUrls = true;
@@ -72,7 +68,9 @@ function createNativeShell(config) {
             this.loading = loading;
             this.appRouter = appRouter;
             this.appHost = appHost;
-            this.setTransparency = dashboard.default.setBackdropTransparency.bind(dashboard.default);
+            this._setTransparency = dashboard.default.setBackdropTransparency.bind(
+                dashboard.default
+            );
 
             this._src = null;
             this._paused = false;
@@ -84,32 +82,26 @@ function createNativeShell(config) {
             this._pendingStart = null;
             this._videoDialog = null;
 
-            this._bridgeReady = getBridge().then(player => {
-                player.playbackStarted.connect(() => this._onPlaybackStarted());
-                player.playbackEnded.connect(() => this._onPlaybackEnded());
-                player.playbackFailed.connect(message => this._onPlaybackFailed(message));
-                player.positionChanged.connect(value => this._onPositionChanged(value));
-                player.pauseChanged.connect(value => this._onPauseChanged(value));
+            this._bridgeReady = getMpvBridge().then(bridge => {
+                bridge.playbackStarted.connect(() => this._onPlaybackStarted());
+                bridge.playbackEnded.connect(() => this._onPlaybackEnded());
+                bridge.playbackFailed.connect(message => this._onPlaybackFailed(message));
+                bridge.positionChanged.connect(value => this._onPositionChanged(value));
+                bridge.pauseChanged.connect(value => this._onPauseChanged(value));
             });
-            void this._bridgeReady.catch(error => {
-                console.error(`${logPrefix} ${error.message}`);
-            });
+            void this._bridgeReady.catch(logError);
         }
 
         canPlayMediaType(mediaType) {
             return String(mediaType || "").toLowerCase() === "video";
         }
 
-        canPlayItem(item) {
-            return this.canPlayMediaType(item?.MediaType);
-        }
-
-        supportsPlayMethod() {
-            return true;
-        }
-
         getDeviceProfile(item, options) {
             return this.appHost.getDeviceProfile(item, options);
+        }
+
+        supports() {
+            return false;
         }
 
         async play(options) {
@@ -151,16 +143,11 @@ function createNativeShell(config) {
                 if (this._src !== src) {
                     throw new Error("MPV stopped while starting playback");
                 }
-                if (this._pendingStart?.src === src) {
-                    this._pendingStart = null;
-                }
+                this._takePendingStart(src);
             } catch (error) {
-                if (this._pendingStart?.src === src) {
-                    this._pendingStart = null;
-                }
+                this._takePendingStart(src);
                 if (this._src === src) {
-                    this._src = null;
-                    this._removeVideoDialog();
+                    this._resetPlayback();
                 }
                 this.loading?.hide();
                 throw error;
@@ -174,7 +161,7 @@ function createNativeShell(config) {
                             this._videoDialog.style.zIndex = "unset";
                         }
                     })
-                    .catch(error => console.error(`${logPrefix} ${error.message}`));
+                    .catch(logError);
             }
             this.events.trigger(this, "playing");
         }
@@ -185,11 +172,13 @@ function createNativeShell(config) {
             try {
                 await sendMpvCommand("stop");
             } finally {
-                this._src = null;
-                this._paused = false;
-                this._removeVideoDialog();
+                this._resetPlayback();
             }
             this.events.trigger(this, "stopped", [{ src }]);
+        }
+
+        destroy() {
+            this._removeVideoDialog();
         }
 
         pause() {
@@ -225,10 +214,6 @@ function createNativeShell(config) {
                 }
             }
             return this._currentTime;
-        }
-
-        currentTimeAsync() {
-            return Promise.resolve(this.currentTime());
         }
 
         duration() {
@@ -272,6 +257,10 @@ function createNativeShell(config) {
             return this._muted;
         }
 
+        canSetAudioStreamIndex() {
+            return false;
+        }
+
         setSubtitleStreamIndex(index) {
             const jellyfinIndex = Number(index);
             if (jellyfinIndex < 0) {
@@ -303,18 +292,16 @@ function createNativeShell(config) {
             sendMpvCommandSoon("set", "sid", "no");
         }
 
+        // MPV events
         _onPlaybackEnded() {
             if (!this._src) {
                 return;
             }
 
             const src = this._src;
-            this._src = null;
-            this._paused = false;
-            this._removeVideoDialog();
-            if (this._pendingStart?.src === src) {
-                const pending = this._pendingStart;
-                this._pendingStart = null;
+            this._resetPlayback();
+            const pending = this._takePendingStart(src);
+            if (pending) {
                 pending.reject(new Error("MPV ended before playback started"));
                 return;
             }
@@ -327,14 +314,11 @@ function createNativeShell(config) {
             }
 
             const src = this._src;
-            this._src = null;
-            this._paused = false;
-            this._removeVideoDialog();
+            this._resetPlayback();
             this.loading?.hide();
             const error = new Error(message);
-            if (this._pendingStart?.src === src) {
-                const pending = this._pendingStart;
-                this._pendingStart = null;
+            const pending = this._takePendingStart(src);
+            if (pending) {
                 pending.reject(error);
             } else {
                 this.events.trigger(this, "error", [error]);
@@ -374,16 +358,29 @@ function createNativeShell(config) {
             this.events.trigger(this, paused ? "pause" : "unpause");
         }
 
-        _cancelPendingStart(error) {
-            if (!this._pendingStart) {
-                return;
+        _takePendingStart(src) {
+            if (this._pendingStart?.src !== src) {
+                return null;
             }
 
             const pending = this._pendingStart;
             this._pendingStart = null;
-            pending.reject(error);
+            return pending;
         }
 
+        _cancelPendingStart(error) {
+            const pending = this._pendingStart;
+            this._pendingStart = null;
+            pending?.reject(error);
+        }
+
+        _resetPlayback() {
+            this._src = null;
+            this._paused = false;
+            this._removeVideoDialog();
+        }
+
+        // Jellyfin's transparent player layer
         _createVideoDialog(options) {
             let dialog = this._videoDialog;
             if (!dialog?.isConnected) {
@@ -397,51 +394,39 @@ function createNativeShell(config) {
             document.body.classList.toggle("hide-scroll", Boolean(options.fullscreen));
 
             this._videoDialog = dialog;
-            this.setTransparency("full");
+            this._setTransparency("full");
         }
 
         _removeVideoDialog() {
             if (document.fullscreenElement) {
-                void document.exitFullscreen().catch(error => {
-                    console.error(`${logPrefix} ${error.message}`);
-                });
+                void document.exitFullscreen().catch(logError);
             }
-            this.setTransparency("none");
+            this._setTransparency("none");
             document.body.classList.remove("hide-scroll");
             this._videoDialog?.remove();
             this._videoDialog = null;
         }
+    
+        name = "MPV Video Player";
+        type = "mediaplayer";
+        id = "mpvvideoplayer";
+}
 
-        getBufferedRanges() {
-            return [];
-        }
-
-        canSetAudioStreamIndex() {
-            return false;
-        }
-
-        supports() {
-            return false;
-        }
-
-        destroy() {
-            this._removeVideoDialog();
-        }
-    }
+    // NativeShell API
+    window.mpvVideoPlayer = () => MpvVideoPlayer;
 
     window.NativeShell = {
-        getPlugins: () => ["mpvVideoPlayer"],
-        AppHost: {
-            init: () => Promise.resolve({ deviceName, appName, appVersion }),
-            supports: feature => feature === "fullscreenchange",
-            getDefaultLayout: () => "desktop",
-            getDeviceProfile: copyDeviceProfile,
-            getSyncProfile: copyDeviceProfile,
-            appName: () => appName,
-            appVersion: () => appVersion,
-            deviceName: () => deviceName
-        }
+        getPlugins: () => ["mpvVideoPlayer"]
     };
 
-    window.mpvVideoPlayer = () => MpvVideoPlayer;
+    window.NativeShell.AppHost = {
+        init() {},
+        supports: feature => String(feature).toLowerCase() === "fullscreenchange",
+        getDefaultLayout: () => "desktop",
+        getDeviceProfile: cloneDeviceProfile,
+        getSyncProfile: cloneDeviceProfile,
+        appName: () => appName,
+        appVersion: () => appVersion,
+        deviceName: () => deviceName
+    };
 }
