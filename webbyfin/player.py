@@ -1,26 +1,38 @@
-import ctypes
-import sys
 import time
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import mpv
 from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtGui import QOpenGLContext
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QWidget
 
 from .constants import MPV_LOG_PREFIX
 
 
-class MpvPlayer(QWidget):
-    """Native Qt video surface backed by one lazy libmpv instance."""
+def _get_proc_address(_context: object, name: bytes) -> int:
+    context = QOpenGLContext.currentContext()
+    if context is None:
+        return 0
 
-    activeChanged = Signal(bool)
+    address = context.getProcAddress(name)
+    return int(address) if address else 0
+
+
+_GET_PROC_ADDRESS = mpv.MpvGlGetProcAddressFn(_get_proc_address)
+
+
+class MpvPlayer(QOpenGLWidget):
+    """Qt-composited video surface backed by libmpv."""
+
     playbackStarted = Signal()
     playbackEnded = Signal()
     playbackFailed = Signal(str)
     positionChanged = Signal(float)
     pauseChanged = Signal(bool)
 
+    _renderRequested = Signal()
     _fileLoaded = Signal(int)
     _fileEnded = Signal(int, int, int, int)
     _positionObserved = Signal(int, float)
@@ -29,24 +41,43 @@ class MpvPlayer(QWidget):
 
     def __init__(self, server_url: str, parent: QWidget) -> None:
         super().__init__(parent)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setStyleSheet("background: black;")
 
         server = urlsplit(server_url)
         self._server_url = server_url
         self._server_origin = server.scheme.lower(), server.netloc.lower()
-        self._mpv: mpv.MPV | None = None
+        self._mpv: mpv.MPV | None = self._create_player()
+        self._render_context: mpv.MpvRenderContext | None = None
         self._entry_id: int | None = None
         self._loaded = False
         self._pending_subtitle: str | None = None
         self._closed = False
 
         queued = Qt.ConnectionType.QueuedConnection
+        self._renderRequested.connect(self.update, queued)
         self._fileLoaded.connect(self._on_file_loaded, queued)
         self._fileEnded.connect(self._on_file_ended, queued)
         self._positionObserved.connect(self._on_position_changed, queued)
         self._pauseObserved.connect(self._on_pause_changed, queued)
         self._coreStopped.connect(self._on_core_stopped, queued)
+
+    def initializeGL(self) -> None:
+        self._create_render_context()
+        self.context().aboutToBeDestroyed.connect(self._release_render_context)
+
+    def paintGL(self) -> None:
+        context = self._render_context
+        if context is None:
+            return
+
+        scale = self.devicePixelRatioF()
+        context.render(
+            opengl_fbo={
+                "fbo": self.defaultFramebufferObject(),
+                "w": round(self.width() * scale),
+                "h": round(self.height() * scale),
+            },
+            flip_y=True,
+        )
 
     def dispatch(self, command: str, args: list[Any]) -> bool:
         """Execute one command produced by native.js."""
@@ -75,7 +106,7 @@ class MpvPlayer(QWidget):
         return True
 
     def shutdown(self) -> None:
-        """Stop libmpv before Qt destroys its native render surface."""
+        """Stop libmpv before Qt destroys its render surface."""
 
         if self._closed:
             return
@@ -84,6 +115,7 @@ class MpvPlayer(QWidget):
         self._entry_id = None
         self._loaded = False
         self._pending_subtitle = None
+        self._release_render_context()
         player, self._mpv = self._mpv, None
 
         if player is not None:
@@ -107,7 +139,6 @@ class MpvPlayer(QWidget):
             f"start={float(options['start']):.15g}",
         )
         self._entry_id = int(result["playlist_entry_id"])
-        self.activeChanged.emit(True)
 
     def _stop(self) -> None:
         self._entry_id = None
@@ -115,7 +146,6 @@ class MpvPlayer(QWidget):
         self._pending_subtitle = None
         if self._mpv is not None and not self._mpv.core_shutdown:
             self._mpv.stop()
-        self.activeChanged.emit(False)
 
     def _seek(self, args: list[Any]) -> None:
         seconds, _ = args
@@ -139,22 +169,50 @@ class MpvPlayer(QWidget):
         if self._mpv is not None and not self._mpv.core_shutdown:
             return self._mpv
 
-        # Creating this native child before playback can cover Qt WebEngine.
-        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
-        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
-        window_id = int(self.winId())
-        if sys.platform == "win32":
-            window_id = ctypes.c_uint32(window_id).value
-
-        self._mpv = mpv.MPV(
-            wid=str(window_id),
-            idle=True,
-            osc=True,
-            input_default_bindings=True,
-            input_vo_keyboard=True,
-        )
-        self._register_callbacks(self._mpv)
+        self._release_render_context()
+        self._mpv = self._create_player()
+        if self.isValid():
+            self.makeCurrent()
+            try:
+                self._create_render_context()
+            finally:
+                self.doneCurrent()
         return self._mpv
+
+    def _create_player(self) -> mpv.MPV:
+        player = mpv.MPV(vo="libmpv", idle=True)
+        self._register_callbacks(player)
+        return player
+
+    def _create_render_context(self) -> None:
+        if self._render_context is not None or self._closed:
+            return
+
+        player = self._mpv
+        if player is None or player.core_shutdown:
+            player = self._create_player()
+            self._mpv = player
+
+        context = mpv.MpvRenderContext(
+            player,
+            "opengl",
+            opengl_init_params={"get_proc_address": _GET_PROC_ADDRESS},
+        )
+        self._render_context = context
+        context.update_cb = self._renderRequested.emit
+
+    @Slot()
+    def _release_render_context(self) -> None:
+        context, self._render_context = self._render_context, None
+        if context is None:
+            return
+
+        self.makeCurrent()
+        try:
+            context.update_cb = None
+            context.free()
+        finally:
+            self.doneCurrent()
 
     def _register_callbacks(self, player: mpv.MPV) -> None:
         current_entry_id: int | None = None
@@ -238,7 +296,6 @@ class MpvPlayer(QWidget):
         self._entry_id = None
         self._loaded = False
         self._pending_subtitle = None
-        self.activeChanged.emit(False)
 
         if reason == mpv.MpvEventEndFile.ERROR:
             self.playbackFailed.emit(f"MPV playback failed ({error_code})")
@@ -260,11 +317,11 @@ class MpvPlayer(QWidget):
         if self._closed or entry_id != self._entry_id:
             return
 
+        self._release_render_context()
         self._mpv = None
         self._entry_id = None
         self._loaded = False
         self._pending_subtitle = None
-        self.activeChanged.emit(False)
         self.playbackEnded.emit()
 
     def _media_url(self, value: str) -> str:

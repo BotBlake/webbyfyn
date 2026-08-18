@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QFile, QIODevice, QUrl, Slot
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QFile, QIODevice, Qt, QUrl
+from PySide6.QtGui import QCloseEvent, QColor
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -46,19 +46,21 @@ class JellyfinWindow(QMainWindow):
         server_url = self._server_url(server)
 
         content = QWidget(self)
-        self._stack = QStackedLayout(content)
-        self._stack.setContentsMargins(0, 0, 0, 0)
+        stack = QStackedLayout(content)
+        stack.setContentsMargins(0, 0, 0, 0)
+        stack.setStackingMode(QStackedLayout.StackingMode.StackAll)
 
         self.web = QWebEngineView(content)
-        self.web.setPage(JellyfinPage(self.web))
+        self.web.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        page = JellyfinPage(self.web)
+        page.setBackgroundColor(QColor(Qt.GlobalColor.transparent))
+        self.web.setPage(page)
 
         self.player = MpvPlayer(server_url, content)
-        self.player.hide()
-        self.player.activeChanged.connect(self._set_video_active)
 
-        self._stack.addWidget(self.web)
-        self._stack.addWidget(self.player)
-        self._stack.setCurrentWidget(self.web)
+        stack.addWidget(self.player)
+        stack.addWidget(self.web)
+        stack.setCurrentWidget(self.web)
         self.setCentralWidget(content)
 
         self._player_bridge = MpvBridge(self.player)
@@ -95,15 +97,6 @@ class JellyfinWindow(QMainWindow):
         script.setRunsOnSubFrames(False)
         script.setSourceCode(f"{web_channel_source}\n({factory})({config});")
         self.web.page().scripts().insert(script)
-
-    @Slot(bool)
-    def _set_video_active(self, active: bool) -> None:
-        if active:
-            self._stack.setCurrentWidget(self.player)
-            self.player.setFocus()
-        else:
-            self._stack.setCurrentWidget(self.web)
-            self.web.setFocus()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.player.shutdown()

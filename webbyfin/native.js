@@ -60,7 +60,7 @@ function createNativeShell(config) {
     };
 
     class MpvVideoPlayer {
-        constructor({ events, loading, appHost }) {
+        constructor({ events, loading, appRouter, appHost, dashboard }) {
             this.name = "MPV Video Player";
             this.type = "mediaplayer";
             this.id = "mpvvideoplayer";
@@ -70,7 +70,9 @@ function createNativeShell(config) {
 
             this.events = events;
             this.loading = loading;
+            this.appRouter = appRouter;
             this.appHost = appHost;
+            this.setTransparency = dashboard.default.setBackdropTransparency.bind(dashboard.default);
 
             this._src = null;
             this._paused = false;
@@ -80,6 +82,7 @@ function createNativeShell(config) {
             this._volume = 100;
             this._muted = false;
             this._pendingStart = null;
+            this._videoDialog = null;
 
             this._bridgeReady = getBridge().then(player => {
                 player.playbackStarted.connect(() => this._onPlaybackStarted());
@@ -128,6 +131,7 @@ function createNativeShell(config) {
             const src = options.url;
             this._src = src;
             this._paused = false;
+            this._createVideoDialog(options);
 
             const started = new Promise((resolve, reject) => {
                 this._pendingStart = { src, resolve, reject };
@@ -156,23 +160,36 @@ function createNativeShell(config) {
                 }
                 if (this._src === src) {
                     this._src = null;
+                    this._removeVideoDialog();
                 }
                 this.loading?.hide();
                 throw error;
             }
 
             this.loading?.hide();
+            if (options.fullscreen) {
+                void this.appRouter.showVideoOsd()
+                    .then(() => {
+                        if (this._videoDialog) {
+                            this._videoDialog.style.zIndex = "unset";
+                        }
+                    })
+                    .catch(error => console.error(`${logPrefix} ${error.message}`));
+            }
             this.events.trigger(this, "playing");
         }
 
         async stop() {
             const src = this._src;
             this._cancelPendingStart(new Error("MPV playback was stopped"));
-            await sendMpvCommand("stop");
-            this._src = null;
-            this._paused = false;
+            try {
+                await sendMpvCommand("stop");
+            } finally {
+                this._src = null;
+                this._paused = false;
+                this._removeVideoDialog();
+            }
             this.events.trigger(this, "stopped", [{ src }]);
-            return Promise.resolve();
         }
 
         pause() {
@@ -294,6 +311,7 @@ function createNativeShell(config) {
             const src = this._src;
             this._src = null;
             this._paused = false;
+            this._removeVideoDialog();
             if (this._pendingStart?.src === src) {
                 const pending = this._pendingStart;
                 this._pendingStart = null;
@@ -311,6 +329,7 @@ function createNativeShell(config) {
             const src = this._src;
             this._src = null;
             this._paused = false;
+            this._removeVideoDialog();
             this.loading?.hide();
             const error = new Error(message);
             if (this._pendingStart?.src === src) {
@@ -365,6 +384,29 @@ function createNativeShell(config) {
             pending.reject(error);
         }
 
+        _createVideoDialog(options) {
+            let dialog = this._videoDialog;
+            if (!dialog?.isConnected) {
+                dialog = document.createElement("div");
+                dialog.classList.add("videoPlayerContainer");
+                document.body.prepend(dialog);
+            }
+
+            dialog.style.zIndex = options.fullscreen ? "1000" : "unset";
+            dialog.style.setProperty("background", "transparent", "important");
+            document.body.classList.toggle("hide-scroll", Boolean(options.fullscreen));
+
+            this._videoDialog = dialog;
+            this.setTransparency("full");
+        }
+
+        _removeVideoDialog() {
+            this.setTransparency("none");
+            document.body.classList.remove("hide-scroll");
+            this._videoDialog?.remove();
+            this._videoDialog = null;
+        }
+
         getBufferedRanges() {
             return [];
         }
@@ -377,7 +419,9 @@ function createNativeShell(config) {
             return false;
         }
 
-        destroy() {}
+        destroy() {
+            this._removeVideoDialog();
+        }
     }
 
     window.NativeShell = {
