@@ -4,6 +4,26 @@ function createNativeShell(config) {
     const { appName, appVersion, deviceName, deviceProfile, logPrefix } = config;
     const copyDeviceProfile = () => JSON.parse(JSON.stringify(deviceProfile));
 
+    let bridgePromise;
+    const getBridge = () => {
+        bridgePromise ??= new Promise((resolve, reject) => {
+            if (typeof QWebChannel !== "function" || !window.qt?.webChannelTransport) {
+                reject(new Error("Qt WebChannel is unavailable"));
+                return;
+            }
+
+            new QWebChannel(window.qt.webChannelTransport, channel => {
+                const player = channel.objects.player;
+                if (player) {
+                    resolve(player);
+                } else {
+                    reject(new Error("MPV bridge is unavailable"));
+                }
+            });
+        });
+        return bridgePromise;
+    };
+
     const redactUrl = (value) => {
         try {
             const url = new URL(value, window.location.href);
@@ -20,17 +40,33 @@ function createNativeShell(config) {
             ? [redactUrl(args[0]), ...args.slice(1)]
             : args;
 
-        const message = JSON.stringify({ command, args: loggedArgs });
-        console.info(`${logPrefix} ${message}`);
+        console.info(`${logPrefix} ${JSON.stringify({ command, args: loggedArgs })}`);
+
+        return getBridge().then(player => new Promise((resolve, reject) => {
+            player.dispatch(command, args, accepted => {
+                if (accepted) {
+                    resolve();
+                } else {
+                    reject(new Error(`MPV rejected ${command}`));
+                }
+            });
+        }));
+    };
+
+    const sendMpvCommandSoon = (command, ...args) => {
+        void sendMpvCommand(command, ...args).catch(error => {
+            console.error(`${logPrefix} ${error.message}`);
+        });
     };
 
     class MpvVideoPlayer {
         constructor({ events, loading, appHost }) {
-            this.name = "MPV Command Logger";
+            this.name = "MPV Video Player";
             this.type = "mediaplayer";
             this.id = "mpvvideoplayer";
             this.priority = -1;
             this.isLocalPlayer = true;
+            this.useFullSubtitleUrls = true;
 
             this.events = events;
             this.loading = loading;
@@ -43,6 +79,18 @@ function createNativeShell(config) {
             this._mediaStreams = [];
             this._volume = 100;
             this._muted = false;
+            this._pendingStart = null;
+
+            this._bridgeReady = getBridge().then(player => {
+                player.playbackStarted.connect(() => this._onPlaybackStarted());
+                player.playbackEnded.connect(() => this._onPlaybackEnded());
+                player.playbackFailed.connect(message => this._onPlaybackFailed(message));
+                player.positionChanged.connect(value => this._onPositionChanged(value));
+                player.pauseChanged.connect(value => this._onPauseChanged(value));
+            });
+            void this._bridgeReady.catch(error => {
+                console.error(`${logPrefix} ${error.message}`);
+            });
         }
 
         canPlayMediaType(mediaType) {
@@ -74,24 +122,53 @@ function createNativeShell(config) {
             this._currentTime = startTicks / 10_000;
             this._duration = durationTicks > 0 ? durationTicks / 10_000 : null;
             this._mediaStreams = options.mediaSource?.MediaStreams || [];
+            this._cancelPendingStart(new Error("MPV load was replaced"));
+            await this._bridgeReady;
 
-            sendMpvCommand(
-                "loadfile",
-                options.url,
-                "replace",
-                -1,
-                { start: String(startTicks / 10_000_000) }
-            );
-
-            this._src = options.url;
+            const src = options.url;
+            this._src = src;
             this._paused = false;
+
+            const started = new Promise((resolve, reject) => {
+                this._pendingStart = { src, resolve, reject };
+            });
+
+            try {
+                await Promise.all([
+                    sendMpvCommand(
+                        "loadfile",
+                        src,
+                        "replace",
+                        -1,
+                        { start: String(startTicks / 10_000_000) }
+                    ),
+                    started
+                ]);
+                if (this._src !== src) {
+                    throw new Error("MPV stopped while starting playback");
+                }
+                if (this._pendingStart?.src === src) {
+                    this._pendingStart = null;
+                }
+            } catch (error) {
+                if (this._pendingStart?.src === src) {
+                    this._pendingStart = null;
+                }
+                if (this._src === src) {
+                    this._src = null;
+                }
+                this.loading?.hide();
+                throw error;
+            }
+
             this.loading?.hide();
             this.events.trigger(this, "playing");
         }
 
-        stop() {
+        async stop() {
             const src = this._src;
-            sendMpvCommand("stop");
+            this._cancelPendingStart(new Error("MPV playback was stopped"));
+            await sendMpvCommand("stop");
             this._src = null;
             this._paused = false;
             this.events.trigger(this, "stopped", [{ src }]);
@@ -100,13 +177,13 @@ function createNativeShell(config) {
 
         pause() {
             this._paused = true;
-            sendMpvCommand("set", "pause", true);
+            sendMpvCommandSoon("set", "pause", true);
             this.events.trigger(this, "pause");
         }
 
         unpause() {
             this._paused = false;
-            sendMpvCommand("set", "pause", false);
+            sendMpvCommandSoon("set", "pause", false);
             this.events.trigger(this, "unpause");
         }
 
@@ -127,7 +204,7 @@ function createNativeShell(config) {
                 const milliseconds = Number(value);
                 if (Number.isFinite(milliseconds)) {
                     this._currentTime = Math.max(0, milliseconds);
-                    sendMpvCommand("seek", this._currentTime / 1000, "absolute");
+                    sendMpvCommandSoon("seek", this._currentTime / 1000, "absolute");
                 }
             }
             return this._currentTime;
@@ -152,7 +229,7 @@ function createNativeShell(config) {
             }
 
             this._volume = Math.max(0, Math.min(100, volume));
-            sendMpvCommand("set", "volume", this._volume);
+            sendMpvCommandSoon("set", "volume", this._volume);
             this.events.trigger(this, "volumechange");
         }
 
@@ -170,7 +247,7 @@ function createNativeShell(config) {
 
         setMute(value) {
             this._muted = Boolean(value);
-            sendMpvCommand("set", "mute", this._muted);
+            sendMpvCommandSoon("set", "mute", this._muted);
             this.events.trigger(this, "volumechange");
         }
 
@@ -181,7 +258,7 @@ function createNativeShell(config) {
         setSubtitleStreamIndex(index) {
             const jellyfinIndex = Number(index);
             if (jellyfinIndex < 0) {
-                sendMpvCommand("set", "sid", "no");
+                sendMpvCommandSoon("set", "sid", "no");
                 return;
             }
 
@@ -189,7 +266,7 @@ function createNativeShell(config) {
                 item => item.Type === "Subtitle" && Number(item.Index) === jellyfinIndex
             );
             if (stream?.DeliveryMethod === "External" && stream.DeliveryUrl) {
-                sendMpvCommand("sub-add", stream.DeliveryUrl, "select");
+                sendMpvCommandSoon("sub-add", stream.DeliveryUrl, "select");
                 return;
             }
 
@@ -201,12 +278,91 @@ function createNativeShell(config) {
 
                 relativeIndex += 1;
                 if (Number(item.Index) === jellyfinIndex) {
-                    sendMpvCommand("set", "sid", relativeIndex);
+                    sendMpvCommandSoon("set", "sid", relativeIndex);
                     return;
                 }
             }
 
-            sendMpvCommand("set", "sid", "no");
+            sendMpvCommandSoon("set", "sid", "no");
+        }
+
+        _onPlaybackEnded() {
+            if (!this._src) {
+                return;
+            }
+
+            const src = this._src;
+            this._src = null;
+            this._paused = false;
+            if (this._pendingStart?.src === src) {
+                const pending = this._pendingStart;
+                this._pendingStart = null;
+                pending.reject(new Error("MPV ended before playback started"));
+                return;
+            }
+            this.events.trigger(this, "stopped", [{ src }]);
+        }
+
+        _onPlaybackFailed(message) {
+            if (!this._src) {
+                return;
+            }
+
+            const src = this._src;
+            this._src = null;
+            this._paused = false;
+            this.loading?.hide();
+            const error = new Error(message);
+            if (this._pendingStart?.src === src) {
+                const pending = this._pendingStart;
+                this._pendingStart = null;
+                pending.reject(error);
+            } else {
+                this.events.trigger(this, "error", [error]);
+            }
+        }
+
+        _onPlaybackStarted() {
+            const pending = this._pendingStart;
+            if (!pending || pending.src !== this._src) {
+                return;
+            }
+
+            pending.resolve();
+        }
+
+        _onPositionChanged(value) {
+            const milliseconds = Number(value);
+            if (!this._src || !Number.isFinite(milliseconds)) {
+                return;
+            }
+
+            this._currentTime = Math.max(0, milliseconds);
+            this.events.trigger(this, "timeupdate");
+        }
+
+        _onPauseChanged(value) {
+            if (!this._src) {
+                return;
+            }
+
+            const paused = Boolean(value);
+            if (paused === this._paused) {
+                return;
+            }
+
+            this._paused = paused;
+            this.events.trigger(this, paused ? "pause" : "unpause");
+        }
+
+        _cancelPendingStart(error) {
+            if (!this._pendingStart) {
+                return;
+            }
+
+            const pending = this._pendingStart;
+            this._pendingStart = null;
+            pending.reject(error);
         }
 
         getBufferedRanges() {
