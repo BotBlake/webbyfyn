@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -25,8 +26,36 @@ from .constants import (
 )
 from .player import MpvBridge, MpvPlayer
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class JellyfinPage(QWebEnginePage):
+    def __init__(self, server_url: QUrl, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._server_origin = self._url_origin(server_url)
+
+    def acceptNavigationRequest(
+        self,
+        url: QUrl,
+        navigation_type: QWebEnginePage.NavigationType,
+        is_main_frame: bool,
+    ) -> bool:
+        if is_main_frame and self._url_origin(url) != self._server_origin:
+            _LOGGER.warning("Blocked top-level navigation outside the configured Jellyfin origin")
+            return False
+
+        return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
+
+    @staticmethod
+    def _url_origin(url: QUrl) -> tuple[str, str, int] | None:
+        scheme = url.scheme().lower()
+        host = url.host().lower()
+        if scheme not in {"http", "https"} or not host:
+            return None
+
+        default_port = 443 if scheme == "https" else 80
+        return scheme, host, url.port(default_port)
+
     def javaScriptConsoleMessage(
         self,
         level: QWebEnginePage.JavaScriptConsoleMessageLevel,
@@ -57,7 +86,7 @@ class JellyfinWindow(QMainWindow):
 
         self.web = QWebEngineView(content)
         self.web.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        page = JellyfinPage(self.web)
+        page = JellyfinPage(QUrl(server_url), self.web)
         page.setBackgroundColor(QColor(Qt.GlobalColor.transparent))
         page.settings().setAttribute(
             QWebEngineSettings.WebAttribute.FullScreenSupportEnabled,
