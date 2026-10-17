@@ -1,3 +1,4 @@
+import logging
 import time
 from typing import Any
 from urllib.parse import urljoin
@@ -10,6 +11,8 @@ from PySide6.QtWidgets import QWidget
 
 from .constants import MPV_LOG_PREFIX
 from .urls import url_origin
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _get_proc_address(_context: object, name: bytes) -> int:
@@ -103,8 +106,8 @@ class MpvPlayer(QOpenGLWidget):
                     self._add_subtitle(args)
                 case _:
                     raise ValueError("command is not allowed")
-        except Exception as error:  # noqa: BLE001
-            print(f"{MPV_LOG_PREFIX} rejected {command}: {error}", flush=True)
+        except Exception:
+            _LOGGER.exception("%s rejected MPV command %r", MPV_LOG_PREFIX, command)
             return False
 
         return True
@@ -125,8 +128,8 @@ class MpvPlayer(QOpenGLWidget):
         if player is not None:
             try:
                 player.terminate()
-            except Exception as error:  # noqa: BLE001
-                print(f"{MPV_LOG_PREFIX} shutdown failed: {error}", flush=True)
+            except Exception:
+                _LOGGER.exception("%s failed to shut down", MPV_LOG_PREFIX)
 
     def _loadfile(self, args: list[Any]) -> None:
         url, _, _, options = args
@@ -276,8 +279,8 @@ class MpvPlayer(QOpenGLWidget):
         if subtitle is not None and self._mpv is not None:
             try:
                 self._mpv.sub_add(subtitle, "select")
-            except Exception as error:  # noqa: BLE001
-                print(f"{MPV_LOG_PREFIX} subtitle failed: {error}", flush=True)
+            except Exception:
+                _LOGGER.exception("%s failed to add subtitle", MPV_LOG_PREFIX)
 
         self.playbackStarted.emit()
 

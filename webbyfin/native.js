@@ -3,7 +3,7 @@ function createNativeShell(config) {
 
     const { appName, appVersion, deviceName, deviceProfile, logPrefix } = config;
     const cloneDeviceProfile = () => structuredClone(deviceProfile);
-    const logError = error => console.error(`${logPrefix} ${error.message}`);
+    const logError = error => console.error(`${logPrefix} ${error?.message ?? error}`);
 
     // Qt bridge
     let mpvBridgePromise;
@@ -26,24 +26,7 @@ function createNativeShell(config) {
         return mpvBridgePromise;
     };
 
-    const redactUrl = (value) => {
-        try {
-            const url = new URL(value, window.location.href);
-            url.search = "";
-            url.hash = "";
-            return url.href;
-        } catch {
-            return String(value).split(/[?#]/, 1)[0];
-        }
-    };
-
     const sendMpvCommand = async (command, ...args) => {
-        const loggedArgs = command === "loadfile" || command === "sub-add"
-            ? [redactUrl(args[0]), ...args.slice(1)]
-            : args;
-
-        console.info(`${logPrefix} ${JSON.stringify({ command, args: loggedArgs })}`);
-
         const bridge = await getMpvBridge();
         const accepted = await new Promise(resolve => {
             bridge.dispatch(command, args, resolve);
