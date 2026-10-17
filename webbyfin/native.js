@@ -81,14 +81,28 @@ function createNativeShell(config) {
             this._muted = false;
             this._pendingStart = null;
             this._playRequestId = 0;
+            this._destroyed = false;
+            this._bridge = null;
             this._videoDialog = null;
 
+            this._bridgeHandlers = {
+                started: () => this._onPlaybackStarted(),
+                ended: () => this._onPlaybackEnded(),
+                failed: message => this._onPlaybackFailed(message),
+                position: value => this._onPositionChanged(value),
+                pause: value => this._onPauseChanged(value)
+            };
             this._bridgeReady = getMpvBridge().then(bridge => {
-                bridge.playbackStarted.connect(() => this._onPlaybackStarted());
-                bridge.playbackEnded.connect(() => this._onPlaybackEnded());
-                bridge.playbackFailed.connect(message => this._onPlaybackFailed(message));
-                bridge.positionChanged.connect(value => this._onPositionChanged(value));
-                bridge.pauseChanged.connect(value => this._onPauseChanged(value));
+                if (this._destroyed) {
+                    return;
+                }
+
+                this._bridge = bridge;
+                bridge.playbackStarted.connect(this._bridgeHandlers.started);
+                bridge.playbackEnded.connect(this._bridgeHandlers.ended);
+                bridge.playbackFailed.connect(this._bridgeHandlers.failed);
+                bridge.positionChanged.connect(this._bridgeHandlers.position);
+                bridge.pauseChanged.connect(this._bridgeHandlers.pause);
             });
             void this._bridgeReady.catch(logError);
         }
@@ -106,6 +120,9 @@ function createNativeShell(config) {
         }
 
         async play(options) {
+            if (this._destroyed) {
+                throw new Error("MPV player was destroyed");
+            }
             if (!options?.url) {
                 throw new Error("Jellyfin did not provide a media URL");
             }
@@ -121,7 +138,7 @@ function createNativeShell(config) {
             this._mediaStreams = options.mediaSource?.MediaStreams || [];
             this._cancelPendingStart(new Error("MPV load was replaced"));
             await this._bridgeReady;
-            if (playRequestId !== this._playRequestId) {
+            if (this._destroyed || playRequestId !== this._playRequestId) {
                 throw new Error("MPV load was replaced");
             }
 
@@ -173,6 +190,7 @@ function createNativeShell(config) {
 
         async stop() {
             const src = this._src;
+            this._playRequestId += 1;
             this._cancelPendingStart(new Error("MPV playback was stopped"));
             try {
                 await sendMpvCommand("stop");
@@ -183,7 +201,26 @@ function createNativeShell(config) {
         }
 
         destroy() {
-            this._removeVideoDialog();
+            if (this._destroyed) {
+                return;
+            }
+
+            this._destroyed = true;
+            this._playRequestId += 1;
+            this._cancelPendingStart(new Error("MPV player was destroyed"));
+            this._resetPlayback();
+            this.loading?.hide();
+            sendMpvCommandSoon("stop");
+
+            const bridge = this._bridge;
+            if (bridge) {
+                bridge.playbackStarted.disconnect(this._bridgeHandlers.started);
+                bridge.playbackEnded.disconnect(this._bridgeHandlers.ended);
+                bridge.playbackFailed.disconnect(this._bridgeHandlers.failed);
+                bridge.positionChanged.disconnect(this._bridgeHandlers.position);
+                bridge.pauseChanged.disconnect(this._bridgeHandlers.pause);
+                this._bridge = null;
+            }
         }
 
         pause() {
@@ -332,7 +369,11 @@ function createNativeShell(config) {
 
         _onPlaybackStarted() {
             const pending = this._pendingStart;
-            if (!pending || pending.src !== this._src) {
+            if (
+                !pending
+                || pending.src !== this._src
+                || pending.playRequestId !== this._playRequestId
+            ) {
                 return;
             }
 
