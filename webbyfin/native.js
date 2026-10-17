@@ -80,6 +80,7 @@ function createNativeShell(config) {
             this._volume = 100;
             this._muted = false;
             this._pendingStart = null;
+            this._playRequestId = 0;
             this._videoDialog = null;
 
             this._bridgeReady = getMpvBridge().then(bridge => {
@@ -109,6 +110,7 @@ function createNativeShell(config) {
                 throw new Error("Jellyfin did not provide a media URL");
             }
 
+            const playRequestId = ++this._playRequestId;
             const startTicks = Number(options.playerStartPositionTicks) || 0;
             const durationTicks = Number(
                 options.mediaSource?.RunTimeTicks ?? options.item?.RunTimeTicks
@@ -119,6 +121,9 @@ function createNativeShell(config) {
             this._mediaStreams = options.mediaSource?.MediaStreams || [];
             this._cancelPendingStart(new Error("MPV load was replaced"));
             await this._bridgeReady;
+            if (playRequestId !== this._playRequestId) {
+                throw new Error("MPV load was replaced");
+            }
 
             const src = options.url;
             this._src = src;
@@ -126,7 +131,7 @@ function createNativeShell(config) {
             this._createVideoDialog(options);
 
             const started = new Promise((resolve, reject) => {
-                this._pendingStart = { src, resolve, reject };
+                this._pendingStart = { src, playRequestId, resolve, reject };
             });
 
             try {
@@ -140,13 +145,13 @@ function createNativeShell(config) {
                     ),
                     started
                 ]);
-                if (this._src !== src) {
+                if (playRequestId !== this._playRequestId || this._src !== src) {
                     throw new Error("MPV stopped while starting playback");
                 }
                 this._takePendingStart(src);
             } catch (error) {
                 this._takePendingStart(src);
-                if (this._src === src) {
+                if (playRequestId === this._playRequestId && this._src === src) {
                     this._resetPlayback();
                 }
                 this.loading?.hide();
