@@ -1,6 +1,6 @@
 import time
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin
 
 import mpv
 from PySide6.QtCore import QObject, Qt, Signal, Slot
@@ -9,6 +9,7 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QWidget
 
 from .constants import MPV_LOG_PREFIX
+from .urls import url_origin
 
 
 def _get_proc_address(_context: object, name: bytes) -> int:
@@ -42,9 +43,12 @@ class MpvPlayer(QOpenGLWidget):
     def __init__(self, server_url: str, parent: QWidget) -> None:
         super().__init__(parent)
 
-        server = urlsplit(server_url)
+        server_origin = url_origin(server_url)
+        if server_origin is None:
+            raise ValueError("server URL must use a valid HTTP(S) origin")
+
         self._server_url = server_url
-        self._server_origin = server.scheme.lower(), server.netloc.lower()
+        self._server_origin = server_origin
         self._mpv: mpv.MPV | None = self._create_player()
         self._render_context: mpv.MpvRenderContext | None = None
         self._entry_id: int | None = None
@@ -326,8 +330,7 @@ class MpvPlayer(QOpenGLWidget):
 
     def _media_url(self, value: str) -> str:
         url = urljoin(self._server_url, value)
-        parsed = urlsplit(url)
-        if (parsed.scheme.lower(), parsed.netloc.lower()) != self._server_origin:
+        if url_origin(url) != self._server_origin:
             raise ValueError("media URL must use the configured Jellyfin server")
         return url
 

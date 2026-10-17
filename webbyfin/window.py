@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from urllib.parse import urlparse
 
 from PySide6.QtCore import QFile, QIODevice, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QColor
@@ -25,6 +24,7 @@ from .constants import (
     MPV_LOG_PREFIX,
 )
 from .player import MpvBridge, MpvPlayer
+from .urls import normalize_server_url, url_origin
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ _LOGGER = logging.getLogger(__name__)
 class JellyfinPage(QWebEnginePage):
     def __init__(self, server_url: QUrl, parent: QWidget) -> None:
         super().__init__(parent)
-        self._server_origin = self._url_origin(server_url)
+        self._server_origin = url_origin(server_url.toString())
 
     def acceptNavigationRequest(
         self,
@@ -40,21 +40,11 @@ class JellyfinPage(QWebEnginePage):
         navigation_type: QWebEnginePage.NavigationType,
         is_main_frame: bool,
     ) -> bool:
-        if is_main_frame and self._url_origin(url) != self._server_origin:
+        if is_main_frame and url_origin(url.toString()) != self._server_origin:
             _LOGGER.warning("Blocked top-level navigation outside the configured Jellyfin origin")
             return False
 
         return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
-
-    @staticmethod
-    def _url_origin(url: QUrl) -> tuple[str, str, int] | None:
-        scheme = url.scheme().lower()
-        host = url.host().lower()
-        if scheme not in {"http", "https"} or not host:
-            return None
-
-        default_port = 443 if scheme == "https" else 80
-        return scheme, host, url.port(default_port)
 
     def javaScriptConsoleMessage(
         self,
@@ -151,14 +141,4 @@ class JellyfinWindow(QMainWindow):
 
     @staticmethod
     def _server_url(server: str) -> str:
-        server = server.strip().rstrip("/")
-
-        parsed = urlparse(server)
-
-        if parsed.scheme not in {"http", "https"}:
-            server = f"http://{server}"
-
-        if not server.endswith("/web"):
-            server += "/web"
-
-        return server + "/"
+        return normalize_server_url(server)
