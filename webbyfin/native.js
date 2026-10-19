@@ -1,30 +1,33 @@
 function createNativeShell(config) {
     "use strict";
 
-    const { appName, appVersion, deviceName, deviceProfile, logPrefix } = config;
+    const { appName, appVersion, deviceName, deviceId, savedServer, deviceProfile, logPrefix } = config;
     const cloneDeviceProfile = () => structuredClone(deviceProfile);
     const logError = error => console.error(`${logPrefix} ${error?.message ?? error}`);
 
     // Qt bridge
-    let mpvBridgePromise;
-    const getMpvBridge = () => {
-        mpvBridgePromise ??= new Promise((resolve, reject) => {
+    let channelPromise;
+    const getChannel = () => {
+        channelPromise ??= new Promise((resolve, reject) => {
             if (typeof QWebChannel !== "function" || !window.qt?.webChannelTransport) {
                 reject(new Error("Qt WebChannel is unavailable"));
-            return;
+                return;
             }
 
-            new QWebChannel(window.qt.webChannelTransport, channel => {
-                const bridge = channel.objects.player;
-                if (bridge) {
-                    resolve(bridge);
-                } else {
-                    reject(new Error("MPV bridge is unavailable"));
-                }
-            });
+            new QWebChannel(window.qt.webChannelTransport, resolve);
         });
-        return mpvBridgePromise;
+        return channelPromise;
     };
+
+    const getBridge = async name => {
+        const bridge = (await getChannel()).objects[name];
+        if (!bridge) {
+            throw new Error(`${name} bridge is unavailable`);
+        }
+        return bridge;
+    };
+
+    const getMpvBridge = () => getBridge("player");
 
     const sendMpvCommand = async (command, ...args) => {
         const bridge = await getMpvBridge();
@@ -441,11 +444,60 @@ function createNativeShell(config) {
         id = "mpvvideoplayer";
 }
 
+    // Remembered session (kept in the OS keyring by the Python side)
+    const CREDENTIALS_KEY = "jellyfin_credentials";
+
+    const readCredentials = () => {
+        try {
+            return JSON.parse(localStorage.getItem(CREDENTIALS_KEY)) ?? {};
+        } catch {
+            return {};
+        }
+    };
+
+    // The web profile is in-memory, so the token only lives in localStorage for this run.
+    try {
+        if (savedServer && !localStorage.getItem(CREDENTIALS_KEY)) {
+            localStorage.setItem(CREDENTIALS_KEY, JSON.stringify({ Servers: [savedServer] }));
+        }
+    } catch (error) {
+        logError(error);
+    }
+
+    const callSession = async (method, ...args) => {
+        const bridge = await getBridge("session");
+        return new Promise(resolve => bridge[method](...args, resolve));
+    };
+
+    const isRememberMeEnabled = () => localStorage.getItem("enableAutoLogin") !== "false";
+
+    const syncRememberedSession = async (user, accessToken) => {
+        if (!isRememberMeEnabled()) {
+            await callSession("clear");
+            return;
+        }
+
+        const server = readCredentials().Servers?.find(s => s.Id === user.ServerId);
+        const record = {
+            ...server,
+            Id: user.ServerId,
+            UserId: user.Id,
+            AccessToken: accessToken,
+            ManualAddress: server?.ManualAddress ?? location.origin
+        };
+        if (!(await callSession("save", JSON.stringify(record)))) {
+            logError("Could not remember the session");
+        }
+    };
+
     // NativeShell API
     window.mpvVideoPlayer = () => MpvVideoPlayer;
 
     window.NativeShell = {
-        getPlugins: () => ["mpvVideoPlayer"]
+        getPlugins: () => ["mpvVideoPlayer"],
+        onLocalUserSignedIn: (user, accessToken) =>
+            syncRememberedSession(user, accessToken).catch(logError),
+        onLocalUserSignedOut: () => callSession("clear").catch(logError)
     };
 
     window.NativeShell.AppHost = {
@@ -456,6 +508,7 @@ function createNativeShell(config) {
         getSyncProfile: cloneDeviceProfile,
         appName: () => appName,
         appVersion: () => appVersion,
-        deviceName: () => deviceName
+        deviceName: () => deviceName,
+        deviceId: () => deviceId
     };
 }

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import QFile, QIODevice, Qt, QUrl
+from PySide6.QtCore import QFile, QIODevice, QSettings, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QColor
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import (
@@ -23,6 +25,7 @@ from .constants import (
     DEVICE_PROFILE,
     MPV_LOG_PREFIX,
 )
+from .credentials import SessionBridge, SessionStore
 from .player import MpvBridge, MpvPlayer
 from .urls import normalize_server_url, url_origin
 
@@ -94,10 +97,14 @@ class JellyfinWindow(QMainWindow):
 
         self._player_bridge = MpvBridge(self.player)
         self._channel = QWebChannel(self.web.page())
+        scheme, host, port = url_origin(server_url)
+        self._session_store = SessionStore(f"{scheme}://{host}:{port}")
+        self._session_bridge = SessionBridge(self._session_store, self)
         self._channel.registerObject("player", self._player_bridge)
+        self._channel.registerObject("session", self._session_bridge)
         self.web.page().setWebChannel(self._channel)
 
-        self._install_native_shell()
+        self._install_native_shell(self._session_store.load())
 
         self.web.load(QUrl(server_url))
 
@@ -109,7 +116,17 @@ class JellyfinWindow(QMainWindow):
         else:
             self.showNormal()
 
-    def _install_native_shell(self) -> None:
+    @staticmethod
+    def _device_id() -> str:
+        # Jellyfin keeps one token per DeviceId, so it must survive restarts.
+        settings = QSettings()
+        device_id = settings.value("deviceId", type=str)
+        if not device_id:
+            device_id = str(uuid.uuid4())
+            settings.setValue("deviceId", device_id)
+        return device_id
+
+    def _install_native_shell(self, saved_server: dict[str, Any] | None) -> None:
         factory = Path(__file__).with_name("native.js").read_text(encoding="utf-8")
         web_channel_file = QFile(":/qtwebchannel/qwebchannel.js")
         if not web_channel_file.open(QIODevice.OpenModeFlag.ReadOnly):
@@ -121,6 +138,8 @@ class JellyfinWindow(QMainWindow):
                 "appName": CLIENT_NAME,
                 "appVersion": CLIENT_VERSION,
                 "deviceName": DEVICE_NAME,
+                "deviceId": self._device_id(),
+                "savedServer": saved_server,
                 "deviceProfile": DEVICE_PROFILE,
                 "logPrefix": MPV_LOG_PREFIX,
             },
