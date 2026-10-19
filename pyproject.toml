@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "keyring>=25.7.0",
     "mpv>=1.0.8",
     "pyside6>=6.11.2",
 ]
